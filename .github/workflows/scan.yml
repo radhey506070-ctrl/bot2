@@ -12,6 +12,9 @@ on:
       ignore_time:
         description: "Entry time window ignore karo (testing) (true/false)"
         default: "false"
+      mult:
+        description: "Volume multiple (normal: 3, testing ke liye 0.5 rakho)"
+        default: "3"
 
 permissions:
   contents: read
@@ -56,7 +59,7 @@ jobs:
 
       - name: Volume surge scan
         run: |
-          python upstox_volume_scanner.py --universe universe.txt --csv scan.csv | tee scan.txt
+          python upstox_volume_scanner.py --universe universe.txt --mult "${{ inputs.mult || '3' }}" --csv scan.csv | tee scan.txt
           {
             echo "### Volume surge scan ($(date '+%d-%b %H:%M IST'))"
             echo '```'
@@ -67,7 +70,7 @@ jobs:
       - name: Strategy signals (PDF playbook)
         if: github.event_name == 'schedule' || inputs.run_strategy == 'true'
         run: |
-          ARGS="--universe universe.txt --capital 100000 --risk 500"
+          ARGS="--universe universe.txt --mult ${{ inputs.mult || '3' }} --capital 100000 --risk 500"
           if [ "${{ inputs.ignore_time }}" = "true" ]; then ARGS="$ARGS --ignore-time"; fi
           python volume_surge_strategy.py $ARGS | tee signals.txt
           {
