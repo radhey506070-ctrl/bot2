@@ -1,0 +1,93 @@
+name: Volume Surge Scan
+
+on:
+  schedule:
+    # NSE 09:30-15:20 IST = 04:00-09:50 UTC, Mon-Fri, har 10 minute
+    - cron: "*/10 4-9 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      run_strategy:
+        description: "Strategy signals bhi chalao? (true/false)"
+        default: "true"
+      ignore_time:
+        description: "Entry time window ignore karo (testing) (true/false)"
+        default: "false"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: volume-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      TZ: Asia/Kolkata            # script ka time window IST me chale
+      UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}   # Analytics Token (1 saal valid)
+      TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Aaj ki date (IST)
+        id: d
+        run: echo "day=$(date +%F)" >> "$GITHUB_OUTPUT"
+
+      # Daily stats cache + journal ko same din ke runs ke beech yaad rakhta hai
+      - name: Restore daily state
+        uses: actions/cache@v4
+        with:
+          path: |
+            cache
+            journal.csv
+          key: state-${{ steps.d.outputs.day }}-${{ github.run_id }}
+          restore-keys: state-${{ steps.d.outputs.day }}-
+
+      - name: Volume surge scan
+        run: |
+          python upstox_volume_scanner.py --universe universe.txt --csv scan.csv | tee scan.txt
+          {
+            echo "### Volume surge scan ($(date '+%d-%b %H:%M IST'))"
+            echo '```'
+            cat scan.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Strategy signals (PDF playbook)
+        if: github.event_name == 'schedule' || inputs.run_strategy == 'true'
+        run: |
+          ARGS="--universe universe.txt --capital 100000 --risk 500"
+          if [ "${{ inputs.ignore_time }}" = "true" ]; then ARGS="$ARGS --ignore-time"; fi
+          python volume_surge_strategy.py $ARGS | tee signals.txt
+          {
+            echo "### Strategy signals"
+            echo '```'
+            cat signals.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          # Naya signal mila to Telegram par bhejo (optional, secrets set ho tab)
+          if grep -q "✅" signals.txt && [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ]; then
+            curl -s "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TG_CHAT}" \
+              --data-urlencode "text=$(grep '✅' signals.txt)" > /dev/null
+          fi
+
+      - name: Save scan CSV
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-results
+          path: scan.csv
+          if-no-files-found: ignore
+          retention-days: 7
