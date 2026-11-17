@@ -41,7 +41,7 @@ CACHE.mkdir(exist_ok=True)
 DEFAULT_UNIVERSE = """
 RELIANCE TCS HDFCBANK INFY ICICIBANK HINDUNILVR ITC SBIN BHARTIARTL KOTAKBANK LT AXISBANK
 ASIANPAINT MARUTI SUNPHARMA TITAN BAJFINANCE ULTRACEMCO NESTLEIND WIPRO HCLTECH M&M NTPC
-POWERGRID TATAMOTORS TATASTEEL JSWSTEEL ADANIENT ADANIPORTS ONGC COALINDIA TECHM INDUSINDBK
+POWERGRID TMPV TMCV TATASTEEL JSWSTEEL ADANIENT ADANIPORTS ONGC COALINDIA TECHM INDUSINDBK
 BAJAJFINSV DRREDDY CIPLA GRASIM HINDALCO EICHERMOT BPCL HEROMOTOCO BRITANNIA APOLLOHOSP
 DIVISLAB SBILIFE HDFCLIFE TRENT BEL SHRIRAMFIN JIOFIN
 """.split()
@@ -166,7 +166,11 @@ def scan(api, sym_keys, mult=3.0, lookback=20, min_value_cr=10.0, min_price=50.0
                          pdh=st["pdh"], pdl=st["pdl"]))
     df = pd.DataFrame(rows)
     if df.empty:
+        print(f"[info] 0/{len(sym_keys)} stocks ka data mila (market band / token / data issue?)")
         return df
+    top = df.sort_values('vol_x', ascending=False).head(3)
+    print(f"[info] data mila: {len(df)}/{len(sym_keys)} stocks | sabse high vol_x: " +
+          ", ".join(f"{r.symbol} {r.vol_x:.2f}x" for r in top.itertuples()))
     ok = ((df.vol_x >= mult) & (df.avg_val_cr >= min_value_cr) & (df.ltp >= min_price)
           & (df.spread_pct.isna() | (df.spread_pct <= max_spread_pct)))
     return df[ok].sort_values("vol_x", ascending=False).reset_index(drop=True)
