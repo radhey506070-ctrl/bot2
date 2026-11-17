@@ -1,0 +1,196 @@
+//@version=5
+// =====================================================================
+// Volume Surge Intraday Strategy (PDF Playbook)  -  educational only
+// Flow: Volume surge filter -> Trend -> Opening Range break -> Volume/candle
+//       validation -> Stop (invalidation) -> Room check -> Position sizing
+// Chart: NSE stock, 5-minute timeframe (1-15 min allowed)
+// Not investment advice. Paper trade / forward test before using real money.
+// =====================================================================
+strategy("Volume Surge Intraday (PDF Playbook)", overlay=true,
+     process_orders_on_close=true, pyramiding=0, initial_capital=100000,
+     commission_type=strategy.commission.percent, commission_value=0.03, slippage=2,
+     max_labels_count=500)
+
+if not timeframe.isintraday
+    runtime.error("Intraday chart (1-15 min, best: 5 min) use karo.")
+
+// ------------------------------------------------------------ inputs
+g1 = "1) Volume surge scan"
+mult      = input.float(3.0,  "Volume multiple (x avg daily volume)", minval=1.0, step=0.5, group=g1)
+lookback  = input.int(20,     "Average volume lookback (days)", minval=5, group=g1)
+minValCr  = input.float(10.0, "Min avg daily traded value (Rs crore)", minval=0, group=g1)
+minPrice  = input.float(50.0, "Min price", minval=0, group=g1)
+
+g2 = "2) Validation"
+orMins    = input.int(15,     "Opening range (minutes)", minval=5, group=g2)
+emaLen    = input.int(20,     "EMA length", minval=2, group=g2)
+maxExtPct = input.float(1.0,  "Max extension beyond OR (%)", minval=0.1, step=0.1, group=g2)
+candleVolMult = input.float(1.2, "Trigger candle volume vs last 10 candles", minval=0.5, step=0.1, group=g2)
+maxWick   = input.float(0.4,  "Max rejection wick / candle range", minval=0.0, maxval=1.0, step=0.05, group=g2)
+sideSel   = input.string("Both", "Trade side", options=["Both", "Long only", "Short only"], group=g2)
+
+g3 = "3) Stop / target / room"
+bufFrac   = input.float(0.05, "Stop buffer (%)", minval=0, step=0.01, group=g3) / 100
+minStopPct= input.float(0.15, "Min stop distance (%)", minval=0.01, group=g3)
+maxStopPct= input.float(1.5,  "Max stop distance (%)", minval=0.1, group=g3)
+rr        = input.float(2.0,  "Target reward:risk", minval=1.0, step=0.5, group=g3)
+minRoomR  = input.float(1.5,  "Next key level (PDH/PDL) min distance in R", minval=0, step=0.5, group=g3)
+
+g4 = "4) Risk management"
+capital   = input.float(100000, "Capital (Rs)", minval=1000, group=g4)
+maxRisk   = input.float(500,    "Max risk per trade (Rs)", minval=1, group=g4)
+leverage  = input.float(1.0,    "Leverage (1 = conservative)", minval=1.0, step=0.5, group=g4)
+maxTrades = input.int(3,        "Max trades per day", minval=1, group=g4)
+dailyLoss = input.float(1500,   "Daily loss limit (Rs)", minval=1, group=g4)
+
+g5 = "5) Timing (exchange time)"
+entryWin  = input.session("0930-1430", "Entry window", group=g5)
+eodTime   = input.int(1515, "Square-off time (HHMM)", minval=900, maxval=1530, group=g5)
+
+// ------------------------------------------------------------ day bookkeeping
+newDay = timeframe.change("D")
+var int   barIdx = 0
+var float dayVol = 0.0
+barIdx := newDay ? 1 : barIdx + 1
+dayVol := newDay ? volume : dayVol + volume
+
+orBars = math.max(1, math.round(orMins / (timeframe.in_seconds() / 60)))
+
+var float orH = na
+var float orL = na
+if newDay
+    orH := high
+    orL := low
+else if barIdx <= orBars
+    orH := math.max(orH, high)
+    orL := math.min(orL, low)
+orDone = barIdx > orBars
+
+// ------------------------------------------------------------ daily data (non-repainting)
+avgVolD = request.security(syminfo.tickerid, "D", ta.sma(volume, lookback)[1], lookahead=barmerge.lookahead_on)
+avgValD = request.security(syminfo.tickerid, "D", ta.sma(close * volume, lookback)[1], lookahead=barmerge.lookahead_on)
+pdh     = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_on)
+pdl     = request.security(syminfo.tickerid, "D", low[1],  lookahead=barmerge.lookahead_on)
+
+volX    = avgVolD > 0 ? dayVol / avgVolD : na
+avgValCr= avgValD / 1e7
+surge   = not na(volX) and volX >= mult and avgValCr >= minValCr and close >= minPrice
+
+// ------------------------------------------------------------ indicators
+vwapV = ta.vwap(hlc3)
+alpha = 2.0 / (emaLen + 1)
+var float emaV = na
+emaV := (newDay or na(emaV)) ? close : alpha * close + (1 - alpha) * emaV
+
+volBase = ta.sma(volume, 10)[1]
+volOK   = na(volBase) or volBase == 0 or volume >= candleVolMult * volBase
+rng     = high - low
+upWick  = high - math.max(open, close)
+dnWick  = math.min(open, close) - low
+
+// ------------------------------------------------------------ day state: trades, loss limit
+var int   tradesToday = 0
+var bool  longDone  = false
+var bool  shortDone = false
+var float dayStartNet = 0.0
+if newDay
+    tradesToday := 0
+    longDone := false
+    shortDone := false
+    dayStartNet := strategy.netprofit
+dayLossHit = (strategy.netprofit - dayStartNet) <= -dailyLoss
+inWin      = not na(time(timeframe.period, entryWin))
+canTrade   = inWin and orDone and surge and strategy.position_size == 0 and tradesToday < maxTrades and not dayLossHit
+
+// ------------------------------------------------------------ LONG validation
+entry  = close
+stopL  = ta.lowest(low, 3) * (1 - bufFrac)
+riskL  = entry - stopL
+rpL    = riskL / entry * 100
+roomL  = not (pdh - entry > 0.001 * entry and pdh - entry < minRoomR * riskL)
+qtyL   = riskL > 0 ? math.min(math.floor(maxRisk / riskL), math.floor(capital * leverage / entry)) : 0
+
+longTrend = close > vwapV and close > emaV
+longBreak = close > orH
+longExt   = (close - orH) / orH * 100 <= maxExtPct
+longCandle= rng > 0 and close > open and upWick / rng <= maxWick
+longStop  = riskL > 0 and rpL >= minStopPct and rpL <= maxStopPct
+
+longSig = canTrade and sideSel != "Short only" and not longDone and longTrend and longBreak and longExt
+     and volOK and longCandle and longStop and roomL and qtyL >= 1
+
+// ------------------------------------------------------------ SHORT validation
+stopS  = ta.highest(high, 3) * (1 + bufFrac)
+riskS  = stopS - entry
+rpS    = riskS / entry * 100
+roomS  = not (entry - pdl > 0.001 * entry and entry - pdl < minRoomR * riskS)
+qtyS   = riskS > 0 ? math.min(math.floor(maxRisk / riskS), math.floor(capital * leverage / entry)) : 0
+
+shortTrend = close < vwapV and close < emaV
+shortBreak = close < orL
+shortExt   = (orL - close) / orL * 100 <= maxExtPct
+shortCandle= rng > 0 and close < open and dnWick / rng <= maxWick
+shortStop  = riskS > 0 and rpS >= minStopPct and rpS <= maxStopPct
+
+shortSig = canTrade and sideSel != "Long only" and not shortDone and shortTrend and shortBreak and shortExt
+     and volOK and shortCandle and shortStop and roomS and qtyS >= 1 and not longSig
+
+// ------------------------------------------------------------ orders
+var float slPx = na
+var float tpPx = na
+
+if longSig
+    slPx := stopL
+    tpPx := entry + rr * riskL
+    strategy.entry("Long", strategy.long, qty=qtyL)
+    tradesToday += 1
+    longDone := true
+    label.new(bar_index, low, "LONG\nSL " + str.tostring(slPx, format.mintick) + "\nTGT " + str.tostring(tpPx, format.mintick)
+         + "\nQty " + str.tostring(qtyL) + "\nVol " + str.tostring(volX, "#.0") + "x",
+         style=label.style_label_up, color=color.new(color.green, 15), textcolor=color.white, size=size.small)
+    alert("LONG " + syminfo.ticker + " entry " + str.tostring(entry) + " SL " + str.tostring(slPx) + " TGT " + str.tostring(tpPx) + " qty " + str.tostring(qtyL), alert.freq_once_per_bar_close)
+
+if shortSig
+    slPx := stopS
+    tpPx := entry - rr * riskS
+    strategy.entry("Short", strategy.short, qty=qtyS)
+    tradesToday += 1
+    shortDone := true
+    label.new(bar_index, high, "SHORT\nSL " + str.tostring(slPx, format.mintick) + "\nTGT " + str.tostring(tpPx, format.mintick)
+         + "\nQty " + str.tostring(qtyS) + "\nVol " + str.tostring(volX, "#.0") + "x",
+         style=label.style_label_down, color=color.new(color.red, 15), textcolor=color.white, size=size.small)
+    alert("SHORT " + syminfo.ticker + " entry " + str.tostring(entry) + " SL " + str.tostring(slPx) + " TGT " + str.tostring(tpPx) + " qty " + str.tostring(qtyS), alert.freq_once_per_bar_close)
+
+if strategy.position_size > 0 or longSig
+    strategy.exit("L-Exit", "Long", stop=slPx, limit=tpPx)
+if strategy.position_size < 0 or shortSig
+    strategy.exit("S-Exit", "Short", stop=slPx, limit=tpPx)
+
+// intraday square-off
+if hour * 100 + minute >= eodTime
+    strategy.close_all(comment="EOD")
+
+// ------------------------------------------------------------ plots
+plot(newDay ? na : orH, "OR High", color.new(color.green, 20), 1, plot.style_linebr)
+plot(newDay ? na : orL, "OR Low",  color.new(color.red, 20),   1, plot.style_linebr)
+plot(vwapV, "VWAP", color.new(color.orange, 0), 2)
+plot(emaV,  "EMA",  color.new(color.blue, 30),  1)
+plot(pdh, "PDH", color.new(color.gray, 40), 1, plot.style_linebr)
+plot(pdl, "PDL", color.new(color.gray, 40), 1, plot.style_linebr)
+bgcolor(surge ? color.new(color.yellow, 92) : na, title="Volume surge")
+
+// ------------------------------------------------------------ info table
+var table t = table.new(position.top_right, 2, 6, bgcolor=color.new(color.black, 20), border_width=1)
+if barstate.islast
+    table.cell(t, 0, 0, "Volume x avg",  text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 0, na(volX) ? "-" : str.tostring(volX, "#.0") + "x", text_color=surge ? color.lime : color.white, text_size=size.small)
+    table.cell(t, 0, 1, "Avg value (Cr)", text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 1, str.tostring(avgValCr, "#.0"), text_color=color.white, text_size=size.small)
+    table.cell(t, 0, 2, "Surge filter", text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 2, surge ? "PASS" : "NO", text_color=surge ? color.lime : color.red, text_size=size.small)
+    table.cell(t, 0, 3, "OR done", text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 3, orDone ? "YES" : "wait", text_color=orDone ? color.lime : color.yellow, text_size=size.small)
+    table.cell(t, 0, 4, "Trades today", text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 4, str.tostring(tradesToday) + "/" + str.tostring(maxTrades), text_color=color.white, text_size=size.small)
+    table.cell(t, 0, 5, "Daily loss limit", text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 5, dayLossHit ? "HIT" : "ok", text_color=dayLossHit ? color.red : color.lime, text_size=size.small)

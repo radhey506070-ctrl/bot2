@@ -1,0 +1,8 @@
+__pycache__/
+cache/
+journal.csv
+scan.csv
+scan.txt
+signals.txt
+.env
+*.pyc
